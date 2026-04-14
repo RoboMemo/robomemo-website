@@ -1,0 +1,9 @@
+# macOS metadata files
+._*
+.DS_Store
+
+# Build artifacts
+site/app/dist/
+site/app/node_modules/
+site/dreamer/node_modules/
+site/app/public/explore/

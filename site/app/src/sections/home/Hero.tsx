@@ -68,6 +68,7 @@ export function Hero() {
             <Button
               size="lg"
               className="bg-white text-black hover:bg-white/90 px-8 py-6 text-base font-medium group"
+              onClick={() => window.location.href = '/explore/'}
             >
               {t('hero.cta')}
               <ArrowRight className="ml-2 h-5 w-5 transition-transform group-hover:translate-x-1" />
