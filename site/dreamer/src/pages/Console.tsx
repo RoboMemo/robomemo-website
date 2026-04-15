@@ -110,7 +110,7 @@ interface LabelResult {
 export default function Console() {
   // Backend connection
   const [backendUrl, setBackendUrl] = useState(() => {
-    return localStorage.getItem("robomemo_backend_url") || "http://localhost:8000";
+    return localStorage.getItem("robomemo_backend_url") || "https://destitute-navigate-street.ngrok-free.dev";
   });
   const [backendStatus, setBackendStatus] = useState<"unknown" | "connected" | "error">("unknown");
   const [showSettings, setShowSettings] = useState(false);
@@ -373,13 +373,90 @@ export default function Console() {
       }))
     );
 
+    /**
+     * Poll a job until done/error, updating stage UI in real-time.
+     * Backend now returns {job_id} immediately; we poll /api/claw/status/{job_id}.
+     */
+    const pollJob = async (bvid: string, jobId: string) => {
+      const POLL_INTERVAL = 4000; // 4s
+      const MAX_POLLS = 180;      // 12 min max (qwen2.5vl:32b is slow)
+      for (let i = 0; i < MAX_POLLS; i++) {
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+        try {
+          const statusRes = await fetch(`${backendUrl}/api/claw/status/${jobId}`, {
+            headers: ngrokHeaders(),
+          });
+          if (!statusRes.ok) continue;
+          const job = await statusRes.json();
+
+          // Update stage statuses in real-time
+          setLabelResults((prev) =>
+            prev.map((r) =>
+              r.bvid === bvid
+                ? {
+                    ...r,
+                    status: job.status === "done" ? "done" : job.status === "error" ? "error" : "labeling",
+                    stages: (job.stages || r.stages).map((s: any, idx: number) => ({
+                      id: s.stage || idx + 1,
+                      name: s.name || r.stages[idx]?.name || `Stage ${idx + 1}`,
+                      status: s.status as any,
+                      result: s.result ? JSON.stringify(s.result) : undefined,
+                    })),
+                  }
+                : r
+            )
+          );
+
+          if (job.status === "done" && job.result) {
+            const data = job.result;
+            const actionPrimitives = (data.phases || []).map(
+              (p: any) => `${p.action_primitive || "unknown"}(target=${p.target_object || "?"}, gripper=${p.gripper_state || "?"})`
+            );
+            const mechanics = (data.phases || [])
+              .map((p: any) => {
+                const cm = p.contact_mechanics || {};
+                return `${p.phase_name}: ${cm.contact_type || "?"} contact, ${cm.force_level || "?"} force, ${cm.motion_direction || "?"}`;
+              })
+              .join(" | ");
+            setLabelResults((prev) =>
+              prev.map((r) =>
+                r.bvid === bvid
+                  ? {
+                      ...r,
+                      status: "done",
+                      output: {
+                        actionPrimitives,
+                        contactMechanics: mechanics,
+                        taskSummary: data.task_summary || "",
+                        lerobotPath: data.lerobot_data
+                          ? `claw_data/${bvid}/labels/lerobot_v2.json`
+                          : undefined,
+                      },
+                    }
+                  : r
+              )
+            );
+            return true; // success
+          }
+          if (job.status === "error") {
+            toast.error(`${bvid} 标注失败: ${job.error || "未知错误"}`);
+            return false;
+          }
+        } catch {
+          // network blip, keep polling
+        }
+      }
+      toast.error(`${bvid} 标注超时`);
+      return false;
+    };
+
     for (const item of passed) {
-      // Update to labeling
       setLabelResults((prev) =>
         prev.map((r) => (r.bvid === item.bvid ? { ...r, status: "labeling" } : r))
       );
 
       try {
+        // Submit job — returns immediately with job_id
         const res = await fetch(`${backendUrl}/api/claw/autolabel`, {
           method: "POST",
           headers: ngrokHeaders({ "Content-Type": "application/json" }),
@@ -390,102 +467,18 @@ export default function Console() {
           }),
         });
 
-        if (!res.ok) throw new Error("标注失败");
-        const data = await res.json();
+        if (!res.ok) throw new Error(await res.text());
+        const submission = await res.json();
+        const jobId: string = submission.job_id;
 
-        // Map backend AutoLabelResult to frontend LabelResult
-        const actionPrimitives = (data.phases || []).map(
-          (p: any) => `${p.action_primitive || 'unknown'}(target=${p.target_object || '?'}, gripper=${p.gripper_state || '?'})`
-        );
-        const mechanics = (data.phases || []).map(
-          (p: any) => {
-            const cm = p.contact_mechanics || {};
-            return `${p.phase_name}: ${cm.contact_type || '?'} contact, ${cm.force_level || '?'} force, ${cm.motion_direction || '?'}`;
-          }
-        ).join(' | ');
+        toast.info(`已提交 ${item.bvid} 标注任务 (${jobId})，正在等待 VLM 处理…`);
 
+        // Poll until done
+        await pollJob(item.bvid, jobId);
+      } catch (err: any) {
+        toast.error(`${item.bvid} 提交失败: ${err?.message || err}`);
         setLabelResults((prev) =>
-          prev.map((r) =>
-            r.bvid === item.bvid
-              ? {
-                  ...r,
-                  status: "done",
-                  stages: (data.stages || []).map((s: any, i: number) => ({
-                    id: s.stage || i + 1,
-                    name: s.name || r.stages[i]?.name || `Stage ${i+1}`,
-                    status: s.status as any || "done",
-                    result: s.result ? JSON.stringify(s.result) : undefined,
-                  })),
-                  output: {
-                    actionPrimitives,
-                    contactMechanics: mechanics,
-                    taskSummary: data.task_summary || '',
-                    lerobotPath: data.lerobot_data ? `claw_data/${item.bvid}/labels/lerobot_v2.json` : undefined,
-                  },
-                }
-              : r
-          )
-        );
-      } catch {
-        // Demo fallback: simulate 4-stage pipeline
-        for (let stageIdx = 0; stageIdx < 4; stageIdx++) {
-          setLabelResults((prev) =>
-            prev.map((r) =>
-              r.bvid === item.bvid
-                ? {
-                    ...r,
-                    stages: r.stages.map((s, i) =>
-                      i === stageIdx
-                        ? { ...s, status: "running" as const }
-                        : i < stageIdx
-                        ? { ...s, status: "done" as const }
-                        : s
-                    ),
-                  }
-                : r
-            )
-          );
-          await new Promise((resolve) =>
-            setTimeout(resolve, 1000 + Math.random() * 1500)
-          );
-          setLabelResults((prev) =>
-            prev.map((r) =>
-              r.bvid === item.bvid
-                ? {
-                    ...r,
-                    stages: r.stages.map((s, i) =>
-                      i === stageIdx ? { ...s, status: "done" as const } : s
-                    ),
-                  }
-                : r
-            )
-          );
-        }
-
-        // Set final demo output
-        setLabelResults((prev) =>
-          prev.map((r) =>
-            r.bvid === item.bvid
-              ? {
-                  ...r,
-                  status: "done",
-                  output: {
-                    actionPrimitives: [
-                      "approach(target=screw, speed=slow)",
-                      "align(tool=screwdriver, angle=90°)",
-                      "insert(depth=2mm, force=gentle)",
-                      "rotate(direction=CW, torque=0.5Nm, turns=3)",
-                      "verify(visual_check=true)",
-                      "retract(speed=medium)",
-                    ],
-                    contactMechanics:
-                      "接触类型: 工具-紧固件啮合 | 估计力: 0.3-0.8N | 接触面积: ~4mm² | 摩擦系数: μ≈0.4 (金属-金属)",
-                    taskSummary: `该视频展示了一个完整的螺丝拧紧操作流程。操作者使用十字螺丝刀，以第一人称视角完成了从接近、对准、插入到旋转拧紧的全过程。操作手法稳定，适合作为 π₀.5 VLA 模型的 SFT 训练数据。`,
-                    lerobotPath: `/sft_output/${item.bvid}/lerobot/`,
-                  },
-                }
-              : r
-          )
+          prev.map((r) => (r.bvid === item.bvid ? { ...r, status: "error" } : r))
         );
       }
     }
@@ -615,8 +608,7 @@ export default function Console() {
                   </Button>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  连接到 Mac Mini 上运行的 RoboMemoClaw 后端。本地开发使用 <code className="text-cyan-400">http://localhost:8000</code>，
-                  公网演示请使用 ngrok 隧道地址。
+                  连接到 Mac Mini 上运行的 RoboMemoClaw 后端。公网演示地址：<code className="text-cyan-400">https://destitute-navigate-street.ngrok-free.dev</code>，本地开发使用 <code className="text-cyan-400">http://localhost:8000</code>。
                 </p>
                 {ollamaModels.length > 0 && (
                   <div className="mt-3 p-3 rounded-lg bg-slate-950/50 border border-border">
